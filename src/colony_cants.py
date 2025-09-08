@@ -667,6 +667,7 @@ class Colony:
         mpi_comm = MPI.COMM_WORLD
         mpi_size = mpi_comm.Get_size()
         rank = mpi_comm.Get_rank()
+        self.logger.info(f"My MPI Rank is : {rank}")
 
         def worker():
             while True:
