@@ -1,74 +1,251 @@
 """
 Ant class for the optimization agents
 """
-
-import sys
-from typing import List
-from threading import Lock
 import numpy as np
+from search_space_cants import SearchSpaceCANTS as Space
+from point import Point
+from util import get_center_of_mass
+import loguru
 
-from search_space_cants import RNNSearchSpaceCANTS
+logger = loguru.logger
+# from threading import Lock
 
+logger = loguru.logger
+logger.add("file_{time}.log")
 
-space_lock = Lock()
+# space_lock = Lock()
 
-
-class Ant:
-    """
-    This class represents the optimization agents
-    """
-
-    def __init__(
-        self,
-        ant_id: int,
-        logger,
-        sense_range: float = 0.5,
-        explore_rate: float = 0.5,
-        mortality: float = 0.0,
-        colony_id: int = None,
-        log_dir: str = ".",
-    ) -> None:
-        self.id = ant_id
-        self.colony_id = colony_id
-        self.sense_range = sense_range
-        self.death_probablity = mortality
-        self.current_x: float = 0.5
-        self.current_y: float = 0.0
-        self.current_w: float = 0.0
-        self.current_l: int = 0
-        self.exploration_rate = explore_rate
-        self.path: List[RNNSearchSpaceCANTS.Point] = []
+class Ant():
+    def __init__(self, space: Space):
+        self.x = 0
+        self.y = 0
+        self.z = 0
+        self.f = 0
+        self.sense_range = np.random.uniform(0.80, 0.90)
+        self.explore_rate = np.random.uniform(0.2, 1.0)
+        self.original_explore_rate = self.explore_rate
         self.mutation_sigma = 0.15
-        self.region_move1 = 0.0
-        self.region_move2 = 0.0
-        self.best_behaviors: List[
-            List[float]
-        ] = []  # [[RNN_performance, exploration_rate, sense_range, region_move]]
-        self.logger = logger
-        self.new_points: List[RNNSearchSpaceCANTS.Point] = []
+        self.space = space
+        self.path = []
+        self.best_behaviors = [] # [[RNN_performance, explore_rate, sense_range]]
+        self.new_points = []
+        self.new_in_points = [] 
 
-    def update_best_behaviors(self, rnn_fitness) -> None:
+    def update_position(self, point):
+        self.x = point.get_x()
+        self.y = point.get_y()
+        self.z = point.get_z()
+        self.f = point.get_f()
+    
+    def add_point_to_space(self, new_point):
+        if new_point.get_node_type() == 0:
+            self.new_points.append(new_point)
+        elif new_point.get_node_type() == 1:
+            self.new_in_points.append(new_point)
+        else:  
+            logger.error(f"Unexpeted Type For Creating New Point: {new_point.get_node_type()}")
+            exit(1)
+        self.update_position(new_point)
+
+    def create_new_point(self, type):
+        logger.debug(f"Creating new point (Type: {type})...")
+        
+        def create_coordinates(coord, lower_bound=0):
+            if type==0:
+                return np.random.uniform(
+                                            max(0, coord - lower_bound), 
+                                            min(coord + self.sense_range, 1)
+                                        )
+            elif type==1:
+                return np.random.uniform(0, 1)
+        # Create a new point based on the current position and pheromone levels
+        lower_bound = self.sense_range
+        x = create_coordinates(self.x, lower_bound=lower_bound)
+        z = create_coordinates(self.z, lower_bound=lower_bound)
+        f = create_coordinates(self.f, lower_bound=lower_bound)
+        if type==0:
+            if z<=self.z:
+                lower_bound = 0
+            y = create_coordinates(self.y, lower_bound=lower_bound)
+            if y>=0.98:
+                return self.pick_output()
+        elif type==1:
+             y = 0
+        else:
+            logger.error(f"Unexpeted Type For Creating New Point: {type}")
+            exit(1)
+
+        logger.trace(f"Creating Point: x={x}, y={y}, z={z}, f={f}, Type={type}")
+        new_point =  Point( x=x, y=y, z=z, f=f, type=type)
+
+        self.add_point_to_space(new_point)
+        return new_point
+
+    def opposite_to_pheromone_center(self, pheromone_center, type):
+        if np.random.uniform() < self.explore_rate: # Explore Randomly
+            return self.create_new_point(type)
+        '''
+        Create a new point opposite to the center of mass of pheromones
+        to explit the search space
+        '''
+        logger.debug(f"Creating Point Opposite to Center of Mass (Type: {type})...")
+        def create_coordinates(coord, cm):
+            opposite_cm = coord - (cm - coord)
+            opposite_cm = max(0, min(opposite_cm, 1))
+            return opposite_cm
+
+        lower_bound = self.sense_range
+        x_ocfm = create_coordinates(self.x, pheromone_center[0])
+        z_ocfm = create_coordinates(self.z, pheromone_center[2])
+        f_ocfm = create_coordinates(self.f, pheromone_center[3])
+        if type==0:
+            y_ocfm = create_coordinates(self.y, pheromone_center[1])
+            y_ocfm = max(y_ocfm, self.y)
+            if y_ocfm>=0.98:
+                return self.pick_output()
+        elif type==1:
+            y_ocfm = 0
+        new_point = Point(x=x_ocfm, y=y_ocfm, z=z_ocfm, f=f_ocfm, type=type)
+        self.add_point_to_space(new_point)
+        logger.trace(f"Creating Point Opposite to Center of Mass: x={x_ocfm}, y={y_ocfm}, z={z_ocfm}, f={f_ocfm}, Type={type}")
+        return new_point
+
+
+    def pick_point(self, points, type):
+        logger.debug(f"Picking Point (Type: {type})...")
+        # Check if any of the output points are within the sense radius
+        nearby_output_points = []
+        if type == 0:   
+            for o_point in self.space.output_points.values():
+                if o_point.distance_to(x=self.x, y=self.y, z=self.z, f=self.f) <= self.sense_range:
+                    nearby_output_points.append(o_point)
+        
+        if nearby_output_points:
+            # If there are nearby output points, pick one of them
+            return self.pick_output()
+
+        # Calculate the center of mass of pheromones
+        pheromone_points = []
+        for point in points:
+            if type == 0:
+                if not(point.get_y() < self.y and point.get_z() < self.z):
+                    if point.distance_to(x=self.x, y=self.y, z=self.z, f=self.f) <= self.sense_range:
+                        pheromone_points.append(point)
+            elif type == 1:
+                if point.distance_to(x=self.x, y=self.y, z=self.z, f=self.f) <= self.sense_range:
+                    pheromone_points.append(point)
+            else:
+                logger.error(f"Unexpeted Type For Picking Point: {type}")
+                exit(1)
+        pheromone_center = get_center_of_mass(pheromone_points)
+        
+        if pheromone_center is None:
+            # If there are no pheromones, create a random new point
+            return self.create_new_point(type)
+
+        if np.random.uniform() < self.explore_rate:
+            # Explore: pick a random point within the sense radius
+            return self.opposite_to_pheromone_center(pheromone_center, type)
+        else:
+            # Exploit: choose the point with the highest pheromone level
+            logger.debug(f"Creating Point at Center of Mass: {pheromone_center} (Type: {type}) ...")
+            x, y, z, f = pheromone_center
+            new_point = Point(x=x, y=y, z=z, f=f, type=type)
+            self.add_point_to_space(new_point)
+            return new_point
+         
+    def pick_input(self,):
+        logger.debug("Picking INPUT")
+        points_within_radius = []
+        for point in self.space.input_points:
+            if point.distance_to(x=self.x, y=self.y, z=self.z, f=self.f) <= self.sense_range:
+                points_within_radius.append(point)
+        chosen_point = self.pick_point(points_within_radius, type=1)
+        if chosen_point.name == "":
+            input_idx = round(chosen_point.get_x()*(len(self.space.input_names)-1))
+            chosen_point.name = self.space.input_names[input_idx]
+            chosen_point.name_idx = input_idx
+        return chosen_point
+
+    def pick_output(self,):
+        logger.debug("Picking OUTPUT")
+        def __pick_point():
+            points = self.space.output_points.values()
+            if np.random.uniform() < self.explore_rate:
+                # Explore: pick a random point within the sense radius
+                point = np.random.choice(list(points), size=1)[0]
+                self.update_position(point)
+                return point
+            else:
+                # Exploit: choose the point with the highest pheromone level
+                expectation = np.random.uniform(0, max([p.get_pheromone() for p in points]))  # TODO: Adjust this value to be the max pheromone level
+                for point in points:
+                    if point.get_pheromone() > expectation:
+                        self.update_position(point)
+                        return point
+                    expectation -= point.get_pheromone()
+        return __pick_point()
+
+    def choose_point(self,):
+        points_within_radius = []
+        for point in self.space.points:
+            if (
+                    not(point.get_x() < self.y and point.get_z() > self.z) and 
+                    point.distance_to(x=self.x, y=self.y, z=self.z, f=self.f) <= self.sense_range
+                ):
+                points_within_radius.append(point)
+        chosen_point = self.pick_point(points_within_radius, type=0)
+        self.x, self.y, self.z, self.f = chosen_point.coordinates()
+        return chosen_point
+
+    def march(self,):
+        self.path.append(self.pick_input())
+        while not self.path[-1].is_output():
+            self.path.append(self.choose_point())
+
+    def reset(self,):
+        self.x = 0
+        self.y = 0
+        self.z = 0
+        self.f = 0
+        self.path = []
+        self.explore_rate = self.original_explore_rate
+        self.new_points = []
+        self.new_in_points = []
+
+
+    """
+    Setting up the Ant's Behavior using Genetic Evolution
+    """
+    def update_best_behaviors(self, fitness) -> None:
         """
-        update ant charactaristics based on the rnn performance
+        Updates the list of the ant's best behaviors based on the provided fitness value.
+
+        If the list of best behaviors contains fewer than 10 entries, the current behavior
+        (fitness, explore_rate, sense_range) is appended. If the list already contains 10 entries,
+        the current behavior replaces the worst (last) entry only if its fitness is better (lower).
+        After updating, the list is sorted in ascending order of fitness.
+
+        Args:
+            fitness (float): The fitness value of the current behavior to consider for inclusion.
+
+        Returns:
+            None
         """
         if len(self.best_behaviors) < 10:
             self.best_behaviors.append(
                 [
-                    rnn_fitness,
-                    self.exploration_rate,
+                    fitness,
+                    self.explore_rate,
                     self.sense_range,
-                    self.region_move1,
-                    self.region_move2,
                 ]
             )
         else:
-            if rnn_fitness < self.best_behaviors[-1][0]:
+            if fitness < self.best_behaviors[-1][0]:
                 self.best_behaviors[-1] = [
-                    rnn_fitness,
-                    self.exploration_rate,
+                    fitness,
+                    self.explore_rate,
                     self.sense_range,
-                    self.region_move1,
-                    self.region_move2,
                 ]
         self.best_behaviors.sort()
 
@@ -85,15 +262,11 @@ class Ant:
             perform mutations
             """
             (
-                self.exploration_rate,
+                self.explore_rate,
                 self.sense_range,
-                self.region_move1,
-                self.region_move2,
             ) = (
-                np.random.random(),
-                np.random.random(),
-                np.random.uniform(low=-1, high=1),
-                np.random.uniform(low=-1, high=1),
+                np.random.uniform(low=0.1, high=0.9),
+                np.random.uniform(low=0.1, high=0.9),
             )
 
         def cross_over(behavior1: np.ndarray, behavior2: np.ndarray):
@@ -106,199 +279,17 @@ class Ant:
                 + behavior1[1:]
             )
             (
-                self.exploration_rate,
+                self.explore_rate,
                 self.sense_range,
-                self.region_move1,
-                self.region_move2,
             ) = new_behavior
 
         if len(self.best_behaviors) < 10 or np.random.random() < self.mutation_sigma:
+            # print("Mutating")
             mutate()
         else:
+            # print("Crossing Over")
             indecies = np.arange(len(self.best_behaviors))
             indecies = np.random.choice(indecies, 2, replace=False)
             cross_over(
                 self.best_behaviors[indecies[0]], self.best_behaviors[indecies[1]]
             )
-
-    def center_of_mass(
-        self, proximity_points: List[RNNSearchSpaceCANTS.Point]
-    ) -> RNNSearchSpaceCANTS.Point:
-        """
-        find the center of mass of points based on pheromone value
-        """
-        pheromone_mass = np.sum([pnt.pheromone for pnt in proximity_points])
-        pheromone_mass_center_x = (
-            np.sum([pnt.pos_x * pnt.pheromone for pnt in proximity_points])
-            / pheromone_mass
-        )
-        pheromone_mass_center_y = (
-            np.sum([pnt.pos_y * pnt.pheromone for pnt in proximity_points])
-            / pheromone_mass
-        )
-        pheromone_mass_center_l = int(
-            np.round(
-                np.sum([pnt.pos_l * pnt.pheromone for pnt in proximity_points])
-                / pheromone_mass
-            )
-        )
-        pheromone_mass_center_w = (
-            np.sum([pnt.pos_w * pnt.pheromone for pnt in proximity_points])
-            / pheromone_mass
-        )
-        point = RNNSearchSpaceCANTS.Point(
-            pheromone_mass_center_x,
-            pheromone_mass_center_y,
-            pheromone_mass_center_l,
-            pheromone_mass_center_w,
-        )
-        return point
-
-    def get_proximity_points(
-        self, all_points: List[RNNSearchSpaceCANTS.Point], same_level: bool
-    ) -> List[RNNSearchSpaceCANTS.Point]:
-        def decide_same_level(pnt_level):
-            if same_level:
-                return pnt_level <= self.current_l
-            return False
-
-        proximity_points = [
-            pnt
-            for pnt in all_points.values()
-            if np.sqrt(
-                (self.current_x - pnt.pos_x) ** 2
-                + (self.current_y - pnt.pos_y) ** 2
-                + (self.current_l - pnt.pos_l) ** 2
-                + (self.current_w - pnt.pos_w) ** 2
-            )
-            <= max(
-                self.sense_range
-                - (
-                    self.current_y**2 * self.region_move1
-                    + self.current_y * self.region_move2
-                ),  # 2nd degree polynomial to control ant speed based on location
-                0.1,
-            )
-            and decide_same_level(pnt.pos_l)
-        ]
-        return proximity_points
-
-    def pick_point(self, space: RNNSearchSpaceCANTS) -> RNNSearchSpaceCANTS.Point:
-        """
-        Pick the next point in the path
-        param: List current_level_points: all points in the current level of ant
-        return: Point: return the picked point or the created point
-        """
-        # TODO: CAN USE CYTHON HERE
-        # with space_lock:
-        proximity_points = self.get_proximity_points(space.all_points, same_level=False)
-        if len(proximity_points) == 0:
-            return self.create_point(space.time_lags)
-        point = self.center_of_mass(proximity_points)
-        if point.pos_l <= self.current_l:
-            proximity_points = self.get_proximity_points(
-                space.all_points, same_level=True
-            )
-
-        for pnt in proximity_points:
-            if (
-                point.pos_x == pnt.pos_x
-                and point.pos_y == pnt.pos_y
-                and point.pos_l == pnt.pos_l
-                and point.pos_w == pnt.pos_w
-            ):
-                point = pnt
-                break
-        return point
-
-    # def create_point(self, space: RNNSearchSpaceCANTS) -> RNNSearchSpaceCANTS.Point:
-    def create_point(self, time_lags: int) -> RNNSearchSpaceCANTS.Point:
-        """
-        Create a new point to be added to the search space
-        """
-
-        # new_l = np.random.randint(self.current_l, space.time_lags - 1, dtype=int)
-        new_l = np.random.randint(self.current_l, time_lags - 1, dtype=int)
-        new_w = np.random.random()
-        new_x = 99
-        while new_x < 0.0 or new_x > 1.0:
-            new_x = (
-                np.random.uniform(-self.sense_range, self.sense_range) + self.current_x
-            )
-        different_level = new_l > self.current_l
-        new_y = max(
-            0.0,
-            min(
-                np.random.uniform(
-                    -self.sense_range if different_level else 0, self.sense_range
-                )
-                + self.current_y,
-                1.0,
-            ),
-        )
-        new_point = RNNSearchSpaceCANTS.Point(new_x, new_y, new_l, new_w)
-        # with space_lock:
-        # space.all_points[new_point.id] = new_point
-        self.new_points.append(new_point)
-        return new_point
-
-    def move(self, space: RNNSearchSpaceCANTS) -> None:
-        """
-        Move from one position to another
-        :param Dict space: all points in the search space
-        """
-
-        with space_lock:
-            if np.random.random() > self.exploration_rate:
-                point = self.pick_point(space)
-                if point.pos_l <= self.current_l and point.pos_y < self.current_y:
-                    self.logger.error(
-                        f"Picked Point Error: P.type:{point.type} \
-                        P.l:{point.pos_l} \
-                        P.y:{point.pos_y} \
-                        Ant.l: {self.current_l} \
-                        Ant.y: {self.current_y}"
-                    )
-                    sys.exit()
-
-            else:
-                point = self.create_point(space.time_lags)
-                if point.pos_l <= self.current_l and point.pos_y < self.current_y:
-                    self.logger.error(
-                        f"Create Point \
-                        P.l:{point.pos_l} \
-                        P.y:{point.pos_y} \
-                        Ant.l: {self.current_l} \
-                        Ant.y: {self.current_y}"
-                    )
-                    sys.exit()
-
-        self.path.append(point)
-        self.current_x = point.pos_x
-        self.current_y = point.pos_y
-        self.current_w = point.pos_w
-        self.current_l = point.pos_l
-
-    def forage(self, space: RNNSearchSpaceCANTS) -> None:
-        """
-        keep moving in the search space till reach output nodes
-        """
-        self.path.append(space.inputs_space.get_input(self.exploration_rate))
-        while self.path[-1].pos_y < 1.0:
-            self.move(space)
-        self.path.pop(-1)
-        self.path.append(space.output_space.get_point())
-        # self.path.append(space.output_space.get_output(self.exploration_rate))
-
-    def reset(
-        self,
-    ) -> None:
-        """
-        reset ant charactaristics
-        """
-        self.path = []
-        self.current_x = 0.5
-        self.current_y = 0.0
-        self.current_w = 0.0
-        self.current_l = 0
-        self.new_points = []

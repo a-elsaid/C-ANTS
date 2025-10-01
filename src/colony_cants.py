@@ -1,882 +1,473 @@
-"""
-A colony controls:
- - the foraging of ants
- - the creation of RNN from the paths of the ants
- - the training/testing of the RNN
- - updating the pheromone value
- - updating the weights in the search space from the tested RNN
- - evolving the ants charactaristics
- - updating the poplution of the best performing RNN
-also use as a PSO particle to evolve coexisting colonies
-"""
-import sys
-from typing import List
-from time import time
-import warnings
-import threading as th
-import numpy as np
-from sklearn.cluster import DBSCAN
-from loguru import logger
-from tqdm import tqdm
-import torch
-from search_space_cants import RNNSearchSpaceCANTS
-from search_space_ants import RNNSearchSpaceANTS
 from ant_cants import Ant
+from search_space_cants import SearchSpaceCANTS as Space
+import numpy as np
+from graph import Graph
 from rnn import RNN
+from util import function_dict, function_names
+from matplotlib import pyplot as plt
+from matplotlib.lines import Line2D
+import sys
 from timeseries import Timeseries
-from helper import Args_Parser
-from datetime import datetime
 import pickle
-from time import time
+from typing import List
 
-now = datetime.now()
-
-sys.path.insert(1, "/home/aaevse/loguru")
-
-warnings.filterwarnings("error")
-#np.warnings.filterwarnings("error", category=np.VisibleDeprecationWarning)
+import multiprocessing as mp
+from loguru import logger
 
 
-class Colony:
-    """
-    Ants Colony
-    """
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+import threading
 
-    counter = 1
+# from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+# import os
 
-    def __init__(
-        self,
-        data: Timeseries,
-        logger: logger,
-        use_cants: bool,
-        use_bp: bool,
-        num_epochs: int,
-        num_ants: int,
-        ants_mortality: int,
-        population_size: int,
-        max_pheromone: float,
-        min_pheromone: float,
-        default_pheromone: float,
-        space_lags: int,
-        dbscan_dist: float,
-        evaporation_rate: float,
-        log_dir: str,
-        out_dir: str,
-        num_threads: int,
-        search_space=None,
-        col_log_level: str = "INFO",
-        log_file_name: str = "",
-        loss_fun: str = "",
-        act_fun: str = "",
-    ) -> None:
-        self.num_threads = num_threads
-        self.logger = logger
-        self.out_dir = out_dir
-        self.log_file_name = log_file_name
-        self.col_log_level = col_log_level
-        self.id = self.counter
-        self.logger = logger.bind(col_id=self.id)
-        self.logger.add(
-            f"{log_dir}/{self.log_file_name}_colony_{self.id}.log",
-            filter=lambda record: record["extra"].get("col_id") == self.id,
-            level=self.col_log_level,
-        )
-        self.num_epochs = num_epochs
-        self.space_lags = space_lags
-        self.use_bp = use_bp
-        self.log_dir = log_dir
-        self.use_cants = use_cants
-        if self.use_bp and self.num_epochs == 0:
-            self.logger.error("Error: Starting ANTS with 0 Number of Epochs")
-            sys.exit()
+
+def _worker(model, data, cost_type: str, colony_id: int):
+        """
+        Child process:
+        - evaluate the model
+        - dump its files (.gv, .eqn, .strct, .png, .model)
+        - return (fit, model_filename, pickled_added_pts, pickled_added_in_pts)
+        """
+        # 1) evaluate
+        fit, _ = model.evaluate(data, cost_type=cost_type)
+
+        # 2) dump artifacts (same as before)
+        base = f"colony_{colony_id}_model_{model.id}_fit_{fit:.6f}"
+        model.visualize_structure(f"{base}.gv")
+        model.generate_eqn(f"{base}.eqn")
+        model.write_structure(f"{base}.strct")
+        model.plot_target_predict(data=data, file_name=f"{base}_target_predict", cost_type=cost_type)
+        fname = f"{base}.model"
+        with open(fname, "wb") as f:
+            pickle.dump(model, f)
+
+        # 3) pickle just the lists of Point objects
+        added_pts    = model.get_added_points()     # List[Point]
+        added_in_pts = model.get_added_in_points()  # List[Point]
+        return float(fit), fname, added_pts, added_in_pts
+
+class Colony():
+    count = 0
+    def __init__(   self,
+                    num_ants: int, 
+                    population_size: int, 
+                    input_names: List[str], 
+                    output_names: List[str],
+                    data: Timeseries,
+                    num_itrs: int = 10,
+                    worker_id: int = None,
+                    out_dir: str = "./OUT",
+                    use_torch: bool = True,
+                    pso_c1:float = 2.05,  # cognative constant
+                    pso_c2:float = 2.05,  # social constant
+                    cost_type: str = "mse",
+                    structure_type: str = "graph",
+                    lr=0.001,
+    ):
+
+        self.id = Colony.count + 1
+        Colony.count += 1
+        self.num_itrs = num_itrs
         self.num_ants = num_ants
-        self.best_population_size = population_size
-        self.mortality_rate = ants_mortality
-        self.evaporation_rate = evaporation_rate
-        self.max_pheromone = max_pheromone
-        self.min_pheromone = min_pheromone
-        self.default_pheromone = default_pheromone
-        self.dbscan_dist = dbscan_dist
         self.data = data
-        self.loss_fun = loss_fun
-        self.act_fun = act_fun
-        self.space = search_space
-        if not self.space:
-            if self.use_cants:
-                self.space = RNNSearchSpaceCANTS(
-                    inputs_names=data.input_names,
-                    outs_names=data.output_names,
-                    lags=self.space_lags,
-                    logger=self.logger,
-                    evaporation_rate=self.evaporation_rate,
-                )
-            else:
-                self.space = RNNSearchSpaceANTS(
-                    inputs_names=data.input_names,
-                    outs_names=data.output_names,
-                    num_hid_nodes=len(data.input_names),
-                    num_hid_layers=10,
-                    lags=self.space_lags,
-                    logger=self.logger,
-                    evaporation_rate=self.evaporation_rate,
-                )
-
-        self.foragers = [
-            Ant(
-                ant_id=i + 1,
-                logger=self.logger,
-                sense_range=np.random.uniform(low=0.1, high=0.9),
-                colony_id=self.id,
-                log_dir=self.log_dir,
-            )
-            for i in range(self.num_ants)
-        ]
-        self.best_rnns = []
-        self.pso_position = [self.num_ants, self.mortality_rate, self.evaporation_rate]
-        self.pso_velocity = np.random.uniform(
-            low=-1, high=1, size=len(self.pso_position)
+        self.best_solutions = []
+        self.best_score = None
+        self.avg_col_score = None
+        self.bst_col_score = None
+        self.boost_exploration = True
+        self.mortality_rate = np.random.uniform(0.1, 0.5)
+        self.evaporation_rate = np.random.uniform(0.1, 0.5)
+        self.original_evaporation_rate = self.evaporation_rate  # Store the original evaporation rate
+        self.population_size = population_size
+        self.life_count = 0
+        self.__use_torch = use_torch
+        self.pso_c1 = pso_c1
+        self.pso_c2 = pso_c2
+        self.cost_type = cost_type
+        self.structure_type = structure_type
+        self.space = Space(
+                            input_names=input_names, 
+                            output_names=output_names, 
+                            evap_rate=self.evaporation_rate
         )
+        self.ants = [Ant(self.space) for _ in range(num_ants)]
+        self.lr = lr
+        
+        self.pso_position = [self.num_ants, self.mortality_rate, self.evaporation_rate]
+        self.pso_velocity = np.random.uniform(low=-1, high=1, size=len(self.pso_position))
         self.pso_best_position = self.pso_position
-        self.pso_bounds = [[10, 300], [0.01, 0.1], [0.15, 0.95]]
-        Colony.counter += 1
+        self.pso_bounds = [[5, 20], [0.01, 0.1], [0.15, 0.95]] # Number of ants, mortality rate, evaporation rate
+        logger.info(f"Colony({self.id}) (Worker_{worker_id}):: Created with {num_ants} ants and {population_size} population size")
+
+        self._lock = threading.Lock()
+        self.out_dir = out_dir
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        del state['_lock']  # remove unpicklable lock
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._lock = threading.Lock()  # recreate the lock
+
+    def set_evaporation_rate(self, rate):
+        self.evaporation_rate = rate
+        self.space.evaporation_rate = rate
+        
+    def check_explored_space(self):
+        no_passed = False
+        prev_i = 0
+        steps = list(np.linspace(0, 1, 5))[1:]
+        for i in steps:
+            prev_j = 0
+            for j in steps:
+                prev_k = 0
+                for k in steps:
+                    prev_l = 0
+                    for l in steps:
+                        no_passed = True
+                        for p in self.space.points:
+                            if (
+                                (prev_i <= p.get_x() <= i) and 
+                                (prev_j <= p.get_y() <= j) and 
+                                (prev_k <= p.get_z() <= k) and 
+                                (prev_l <= p.get_f() <= l)
+                            ):
+                                no_passed = False
+                                break
+                        if no_passed:
+                            break
+                        prev_l = l
+                    if no_passed:
+                        break
+                    prev_k = k
+                if no_passed:
+                    break
+                prev_j = j
+            if no_passed:
+                break
+            prev_i = i
+        return no_passed
+
+    def ants_forage(self, increase_exploration=False):
+        with self._lock:    
+            paths = []
+            for ant in self.ants:
+                ant.reset()
+                if increase_exploration:
+                    ant.explore_rate = 0.999
+                ant.march()
+                paths.append(ant.path)
+                self.space.add_new_points(ant.new_points)
+                self.space.add_input_points(ant.new_in_points)
+        if self.structure_type == "graph":
+            return Graph(
+                            ants_paths=paths, 
+                            space=self.space, 
+                            colony_id=self.id, 
+                            use_torch=self.__use_torch,
+                            cost_type=self.cost_type,
+                        )
+        elif self.structure_type == "rnn":
+            return RNN(
+                            ants_paths=paths, 
+                            space=self.space, 
+                            colony_id=self.id, 
+                            use_torch=self.__use_torch,
+                            cost_type=self.cost_type,
+                        )
+        else:
+            logger.error(f"Unknown structure type: {self.structure_type}. Defaulting to Graph.")
+
+
+    def update_scores(self):
+        self.avg_col_score = np.mean([x[0] for x in self.best_solutions])
+        self.bst_col_score = self.best_solutions[0][0]
+
+
+
+    def insert_to_population(self, score, solution):
+        inserted = False
+        if len(self.best_solutions) < self.population_size:
+            self.best_solutions.append([score, solution])
+            inserted = True
+        elif score > self.best_solutions[0][0]:
+            self.best_solutions[-1] = [score, solution]
+            inserted = True
+        self.best_solutions.sort(key=lambda x: x[0])
+        return inserted
+
+    def evolve_ants(self, fit):
+        for ant in self.ants:
+            ant.update_best_behaviors(fit)
+            ant.evolve_behavior()
+
+    
+    def _dump_model(self, model, fit, cost_type="mse", plot=False):
+        
+        model.visualize_structure(f"{self.out_dir}/colony_{self.id}_model_{model.id}_fit_{fit}.gv")
+        if (False): # fix the condition to work only for Graphs (not RNNS)
+            model.generate_eqn(f"{self.out_dir}/colony_{self.id}_model_{model.id}_fit_{fit}.eqn")
+        model.save_to_file(f"{self.out_dir}/colony_{self.id}_model_{model.id}_fit_{fit}.model")
+        if not plot:
+            return
+        model.write_structure(f"{self.out_dir}/colony_{self.id}_model_{model.id}_fit_{fit}.strct")
+        fig = plt.figure(figsize=(40, 40))
+        ax = fig.add_subplot(111, projection='3d')
+        # model.plot_path_points(ax=ax, plt=plt)
+        model.plot_paths(ax=ax, plt=plt)
+        # model.plot_nodes(ax=ax, plt=plt)
+        model.plot_pheromones(ax=ax, plt=plt)
+
+        function_colors = {
+            0: 'red',
+            1: 'blue',
+            2: 'green',
+            3: 'orange',
+            4: 'purple',
+            5: 'brown',
+            6: 'cyan',
+            7: 'magenta',
+            8: 'gold',
+        }
+
+        # Manually create legend entries for whatever you added
+        custom_legend_items = [
+            Line2D([0], [0], marker='*', linestyle='None', markeredgecolor='red', markerfacecolor='red', markersize=80, label='Node'),
+            Line2D([0], [0], linestyle='-', color='gray', label='Ant Path', linewidth=6)
+            # Line2D([0], [0], marker='o', linestyle='None', markeredgecolor='gray', markerfacecolor='gray', markersize=80, label='Space Point'),
+        ]
+
+        for i, func_name in enumerate(function_names.values()):
+            custom_legend_items.append(
+                Line2D([0], [0], marker='o', linestyle='None', markeredgecolor=function_colors[i], markerfacecolor=function_colors[i], markersize=80, label=func_name)
+            )
+
+        # Add the custom legend
+        ax.legend( 
+                    handles=custom_legend_items,
+                    loc='upper left',
+                    fontsize=40,               # Increase font size
+                    handlelength=4,            # Length of the legend handles
+                    borderpad=1.0,             # Padding inside the legend box
+                    labelspacing=1.2,          # Space between labels
+                    handletextpad=1.5,         # Space between handle and text
+                    frameon=True,              # Show legend frame
+                    framealpha=1.0,            # Opaque box
+                    borderaxespad=1.5          # Padding between legend and axes
+        )
+        plt.savefig(f"{self.out_dir}/colony_{self.id}_model_{model.id}_fit_{fit}.png")
+        plt.cla(); plt.clf(); plt.close()
+        model.plot_target_predict(data=self.data, file_name=f"{self.out_dir}/colony_{self.id}_model_{model.id}_fit_{fit}_target_predict", cost_type=cost_type)
+
+        fig = plt.figure(figsize=(40, 40))
+        ax = fig.add_subplot(111, projection='3d')
+        model.plot_nodes(ax=ax, plt=plt)
+        plt.savefig(f"{self.out_dir}/colony_{self.id}_nn_{model.id}_fit_{fit}.png")
+        plt.cla(); plt.clf(); plt.close()
+
+    def _gen_and_eval(self, increase_exploration: bool, cost_type: str, train_epochs: int = 10):
+        """
+        Build a model once, evaluate it, return (fit, model).
+        """
+        thd = threading.current_thread()
+        logger.info(f"Colony({self.id:2d}) -- Thread({thd.name}) -- Generating and Evaluating Model")
+        model = self.ants_forage(increase_exploration=increase_exploration)
+        th_id = threading.current_thread().name
+        fit, _ = model.evaluate(self.data, cost_type=cost_type, num_epochs=train_epochs, thread_id=th_id, lr=self.lr)
+        return fit, model
+
+    def life_threads(self, num_itrs=None, total_itrs=None, cost_type="mse", train_epochs=10):
+        if num_itrs:
+            self.num_itrs = num_itrs
+        executor = ThreadPoolExecutor(max_workers=num_itrs, thread_name_prefix=f"Colony{self.id:2d}-Thread")
+        # each “slot” is one final model you want; we’ll keep trying until it passes
+        pending = []           # list of futures
+        attempts = dict()      # future -> how many times we’ve tried
+
+        # 1) launch one task per iteration slot
+        for slot in range(self.num_itrs):
+            fut = executor.submit(self._gen_and_eval, self.boost_exploration, cost_type, train_epochs=train_epochs)
+            pending.append(fut)
+            attempts[fut] = 1
+
+        done_results = []  # will hold (fit, model) pairs that passed
+
+        # 2) as soon as any future completes, check it:
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for fut in done:
+                pending.remove(fut)
+                count = attempts.pop(fut)
+                fit, model = fut.result()
+
+                # if it’s too weak and we haven’t retried 10× yet → re-submit
+                if fit > 5 and count < 10:
+                    new_fut = executor.submit(self._gen_and_eval, self.boost_exploration, cost_type)
+                    pending.append(new_fut)
+                    attempts[new_fut] = count + 1
+                else:
+                    # it’s good (or we’re out of retries)
+                    done_results.append((fit, model))
+
+        # 3) now process them in arrival order (or sort by fitness, whatever)
+        for fit, model in done_results:
+            logger.info(f"Colony({self.id}) - Model({model.id}) fitness={fit:.4e}")
+
+            # *** shared‐state updates under a lock ***
+            with self._lock:
+                inserted = self.insert_to_population(fit, model)
+                self.evolve_ants(fit)
+                self.space.evaporate_pheromone(self.evaporation_rate)
+                self.space.add_new_points(model.added_points)
+                self.space.add_input_points(model.added_in_points)
+                if inserted:
+                    self.update_scores()
+                    self.space.deposited_pheromone(model)
+                    self._dump_model(model, fit, cost_type=cost_type)
+
+        # 4) clean up
+        for fut in pending:
+            # if it’s still running, cancel it
+            if not fut.done():
+                fut.cancel()
+            else:
+                # if it’s done, we can still get the result
+                try:
+                    fut.result()
+                except Exception as e:
+                    logger.error(f"Colony({self.id}): Error in future: {e}")
+
+        executor.shutdown()
+    
+    def life(self, num_itrs=None, total_itrs=None, cost_type="mse", train_epochs=10):
+        if num_itrs:
+            self.num_itrs = num_itrs
+        patience = 10
+        for itr in range(self.num_itrs):
+            logger.info(f"Colony({self.id}): Iteration: {self.life_count+1}{f'/{total_itrs}' if total_itrs else ''}")
+            self.life_count+=1
+            if self.boost_exploration:
+                space_is_not_explored = self.check_explored_space()
+                if space_is_not_explored:
+                    logger.info(f"Colony({self.id}): Space is not fully explored: Boosting Exploration")
+                    logger.info(f"Colony({self.id}): Setting Evaporation Rate to 0.999: ON HOLD FOR NOW")
+                    # self.evaporation_rate = 0.999
+                else:
+                    logger.info(f"Colony({self.id}): Space is fully explored: Resetting Exploration")
+                    self.boost_exploration = False
+                    self.evaporation_rate = self.original_evaporation_rate
+            model = self.ants_forage(increase_exploration=self.boost_exploration)
+
+            fit, _ = model.evaluate(self.data, cost_type=cost_type, num_epochs=train_epochs)
+            wait = 10
+            while fit > 5 and wait > 0:
+                wait-=1
+                logger.info(f"Colony({self.id}): Fitness is None, ReGenerating & ReEvaluating Model {wait} times left")
+                model = self.ants_forage(increase_exploration=self.boost_exploration)
+                fit, _ = model.evaluate(self.data)
+
+            logger.info(f"Colony({self.id}) - Model({model.id}): Fitness: {fit}")
+            inserted = self.insert_to_population(fit, model)
+
+            self.evolve_ants(fit)
+            if inserted:
+                self.update_scores()
+                self.space.deposited_pheromone(model)
+                self._dump_model(model, fit, cost_type=cost_type)
+
+            self.space.add_new_points(model.added_points)
+            self.space.add_input_points(model.added_in_points)
+            self.space.evaporate_pheromone(self.evaporation_rate)
+
+            '''
+            Resting Colony's Evaporation Rate to Max
+            if no better models are found
+            '''
+            if (not self.boost_exploration) and (not inserted):
+                logger.info(f"Colony({self.id}): No Improvemnet->Resetting Evaporation Rate")
+                patience-=1
+            if patience == 0:
+                self.boost_exploration = True
+                patience = 10
+            prev_inserted = inserted
+
+
+    def get_col_fit(self, rank=None, avg:bool=False) -> float:
+        """return the population best fitness"""
+        self.update_best_colony_score(rank, avg)
+        if avg:
+            return self.avg_population_fit, self.pso_best_position
+        else:
+            return self.bst_col_score, self.pso_best_position
+
+
+
+    def update_best_colony_score(self, rank=None, avg:bool=True) -> None:
+        best_solutions = np.array(self.best_solutions)
+        logger.trace(f"Worker({rank}:: Collecting Fitnees from Colony({self.id})")
+        best_scores = best_solutions[:, 0]
+        best_score  = np.sort(best_scores)[0]
+
+        '''Get avg of colony fits as measure of overall colony-fit'''
+        avg_col_score = sum(best_scores) / len(best_scores) 
+
+
+        if self.avg_col_score is None or avg_col_score < self.avg_col_score:
+            self.avg_col_score = avg_col_score
+            if avg:
+                self.pso_best_position = self.pso_position
+
+        if self.bst_col_score is None or best_score < self.bst_col_score:
+            self.bst_col_score = best_score
+            if not avg:
+                self.pso_best_position = self.pso_position
 
     def update_velocity(self, pos_best_g):
         """update new particle velocity"""
-
-        self.logger.info(f"COLONY({self.id}):: Updating Colony PSO velocity")
-
-        w = 0.5  # constant inertia weight (how much to weigh the previous velocity)
-        c1 = 1  # cognative constant
-        c2 = 2  # social constant
-
+        logger.info(f"COLONY({self.id}):: Updating Colony PSO velocity")
         for i, pos in enumerate(self.pso_position):
             r1 = np.random.random()
             r2 = np.random.random()
-            vel_cognitive = c1 * r1 * (self.pso_best_position[i] - pos)
-            vel_social = c2 * r2 * (pos_best_g[i] - pos)
-            self.pso_velocity[i] = w * self.pso_velocity[i] + vel_cognitive + vel_social
+            vel_cognitive = self.pso_c1 * r1 * (self.pso_best_position[i] - pos)
+            vel_social    = self.pso_c2 * r2 * (pos_best_g[i] - pos)
+            phi = self.pso_c1 + self.pso_c2
+            d = np.abs(2-phi-np.sqrt(phi**2-4*phi))
+            if phi<=4:
+                logger.error("PSO parameters c1 and c2 do not satisfy the convergence condition (phi > 4).")
+                exit(1)
+            x = 2 / d  #  Clerc–Kennedy constriction factor
+            self.pso_velocity[i] = x*(self.pso_velocity[i] + vel_cognitive + vel_social)
 
     def update_position(self):
         """update the particle position based off new velocity updates"""
-        self.logger.info(f"COLONY({self.id}):: Updating Colony PSO position")
-        for i, pos in enumerate(self.pso_position):
-            self.pso_position[i] = pos + self.pso_velocity[i]
+        logger.info(f"COLONY({self.id}):: Updating Colony PSO position")
+        
+        self.num_ants+= self.pso_velocity[0]
+        self.num_ants = int(self.num_ants)
+        self.mortality_rate+= self.pso_velocity[1]
+        self.evaporation_rate+= self.pso_velocity[2]
 
-            # adjust position if necessary
-            if pos < self.pso_bounds[i][0] or pos > self.pso_bounds[i][1]:
-                if i < 1:
-                    self.pso_position[i] = np.random.randint(
-                        low=self.pso_bounds[i][0], high=self.pso_bounds[i][1]
-                    )
-                else:
-                    self.pso_position[i] = np.random.uniform(
-                        low=self.pso_bounds[i][0], high=self.pso_bounds[i][1]
-                    )
-
-            self.space.evaporation_rate = self.evaporation_rate
-
-    def forage(
-        self,
-    ) -> None:
-        """
-        Letting ants forage to create paths to create RNN
-        """
-
-        def ant_thread_work(ant, space):
-            ant.reset()
-            ant.forage(space)
-
-        # threads = []
-        for ant in self.foragers:
-            ant.reset()
-            ant.forage(self.space)
-
-        """
-            threads.append(
-                th.Thread(
-                    target=ant_thread_work, args=(ant, self.space))
+        if self.num_ants < self.pso_bounds[0][0] or self.num_ants > self.pso_bounds[0][1]:
+            self.num_ants = np.random.randint(
+                low=self.pso_bounds[0][0], high=self.pso_bounds[0][1]
             )
-            threads[-1].start()
-
-        for thread in threads:
-            thread.join()
-        for ant in self.foragers:
-            for pnt in ant.new_points:
-                self.space.all_points[pnt.id] = pnt
-        """
-
-    def calcualte_distance_ceteroid_cluster(
-        self,
-        point: RNNSearchSpaceCANTS.Point,
-        cluster: List[RNNSearchSpaceCANTS.Point],
-    ) -> np.ndarray:
-        """
-        calculates distance between the centeriod of cluster
-        and the points in the cluster
-        """
-        distances = []
-        for cluster_point in cluster:
-            distance = (
-                np.sqrt((point.pos_x - cluster_point.pos_x) ** 2)
-                + np.sqrt((point.pos_y - cluster_point.pos_y) ** 2)
-                + np.sqrt((point.pos_l - cluster_point.pos_l) ** 2)
-                + np.sqrt((point.pos_w - cluster_point.pos_w) ** 2)
-            )
-            distances.append(
-                [
-                    distance,
-                    cluster_point,
-                ]
-            )
-        if len(distances) < 2:
-            return [distances[0][1]]
-        try:
-            temp = np.array(sorted(distances, key=lambda d: d[0]))[:, 1]
-        except np.VisibleDeprecationWarning:
-            self.logger.error("Distances list should not be less than 2 elements")
-        return temp
-
-    def update_pheromone_const(
-        self, rnn: RNN, pheromone_increment: float = 1.0
-    ) -> None:
-        """
-        update the pheromone values using a constant
-        """
-        for node in rnn.nodes.values():
-            point = node.point
-            lag_pheromone_boost = (
-                1 + float(self.space_lags - point.pos_l) / self.space_lags
-            )
-            pheromone_increment *= lag_pheromone_boost
-            if point.type == 0:
-                self.space.inputs_space.increase_pheromone(point, pheromone_increment)
-                continue
-            if rnn.centeroids_clusters:
-                if point.type == 2:
-                    self.space.output_space.increase_pheromone(
-                        point, pheromone_increment
-                    )
-                    continue
-                point.pheromone = min(
-                    point.pheromone + pheromone_increment, self.max_pheromone
-                )
-
-                """
-                """
-                # calculate distance between the centeroid and cluster points
-                cluster_distances = self.calcualte_distance_ceteroid_cluster(
-                    point, rnn.centeroids_clusters[point.id]
-                )
-                # distribute pheromone over the cluster points based on distance
-                # from ceteroid
-                pheromone_step = pheromone_increment / len(cluster_distances)
-                for i, pnt in enumerate(rnn.centeroids_clusters[point.id]):
-                    pnt.pheromone += pheromone_step * (i + 1) * (1 + pnt.pos_l * 0.1)
-                    pnt.pheromone = min(pnt.pheromone, self.max_pheromone)
-            else:
-                for edge in node.fan_out.values():
-                    pnt_link = node.point.fan_out[edge.out_node.point]
-                    pnt_link.pheromone = min(
-                        pnt_link.pheromone + pheromone_increment, self.max_pheromone
-                    )
-
-    def update_pheromone_noreg(
-        self,
-    ) -> None:
-        """
-        updating the pheromone values using fitness
-        """
-        ...
-
-    def update_pheromone_l1reg(
-        self,
-    ) -> None:
-        """
-        updating the pheromone values using fitness and L1 regularization
-        """
-        ...
-
-    def update_pheromone_l2_reg(
-        self,
-    ) -> None:
-        """
-        updating the pheromone values using fitness and L2 regularization
-        """
-        ...
-
-    def update_search_space_weights(self, rnn: RNN) -> None:
-        """
-        update the weights of the search space from the trained/tested RNN
-        """
-        with torch.no_grad():
-            for node in rnn.nodes.values():
-                if len(node.fan_out) == 0:
-                    continue
-                if rnn.centeroids_clusters:
-                    node_edges_avr_wghts = np.average(
-                        [e.weight for e in node.fan_out.values()]
-                    )
-                    for cluster_point in rnn.centeroids_clusters.get(node.point.id, []):
-                        cluster_point.pos_w = (
-                            cluster_point.pos_w + node_edges_avr_wghts
-                        ) / 2
-                    node.point.pos_w = (node.point.pos_w + node_edges_avr_wghts) / 2
-                else:
-                    for edge in node.fan_out.values():
-                        point_link = node.point.fan_out[edge.out_node.point]
-                        point_link.weight = (point_link.weight + edge.weight) / 2
-
-    def find_centeroid(self, cluster: np.ndarray) -> RNNSearchSpaceCANTS.Point:
-        """
-        calculate the cenriod of a cluster of points
-        used to condensate the points to a centriod
-        """
-        n = len(cluster)
-        sum_x = np.sum(cluster[:, 0])
-        sum_y = np.sum(cluster[:, 1])
-        sum_l = np.sum(cluster[:, 2])
-        sum_w = np.sum(cluster[:, 3])
-        new_point = RNNSearchSpaceCANTS.Point(
-            sum_x / n, sum_y / n, round(sum_l / n), sum_w / n
-        )
-        self.space.all_points[new_point.id] = new_point
-        return new_point
-
-    def create_nn_ants(
-        self,
-    ) -> RNN:
-        paths = [[] for a in range(self.num_ants)]
-        for a in range(self.num_ants):
-            cur_pnt = self.space.inputs_space.get_input(ant_exploration_rate=0.5)
-            paths[a].append(cur_pnt)
-            while cur_pnt.type != 2:
-                out_links = list(cur_pnt.fan_out.values())
-                pheromones = [link.pheromone for link in out_links]
-                norm_pheromones = pheromones / np.sum(pheromones)
-                next_link = np.random.choice(out_links, 1, p=norm_pheromones)[0]
-                cur_pnt = next_link.out_node
-                paths[a].append(cur_pnt)
-        return RNN(
-            paths=paths,
-            centeroids_clusters=None,
-            lags=self.space_lags,
-            loss_fun=self.loss_fun,
-            act_fun=self.act_fun,
-        )
-
-    def create_nn_cants(
-        self,
-    ) -> RNN:
-        """
-        create RNN from the paths of the ants
-        """
-        self.forage()
-        self.logger.info(f"COLONY({self.id}):: Starting to build RNN from Ants' paths")
-        points = []
-        for ant in self.foragers:
-            for p in ant.path:
-                if p.type not in [0, 2]:
-                    points.append(p)
-        points_vertecies = np.array(
-            [[p.pos_x, p.pos_y, p.pos_l, p.pos_w] for p in points]
-        )
-        db = DBSCAN(
-            eps=self.dbscan_dist, min_samples=2, metric="euclidean", n_jobs=-1
-        ).fit(points_vertecies)
-        labels = db.labels_  # these are the labels for each point in space
-        # number of clusters used to iterate over the labels of the clusters
-        num_clusters = np.max(db.labels_)
-        centeroids = []
-        for i in range(num_clusters + 1):
-            centeroids.append(self.find_centeroid(points_vertecies[labels == i]))
-        # condensed_path: Ant: List[condensed_points]
-        condensed_paths = [[] for _ in range(len(self.foragers))]
-        counter = 0
-        for i, ant in enumerate(self.foragers):
-            prev_pnt = ant.path[0]
-            for p in ant.path:
-                if p.type in [0, 2]:  # checks if the point is for an input or output
-                    condensed_paths[i].append(p)
-                    continue
-                label = labels[counter]
-                counter += 1
-                if label != -1:  # not single point cluster
-                    p = centeroids[label]
-
-                """
-                skip point if same-level and before prev_point
-                or centroid is same as anther point in path
-                """
-                if (p.pos_l <= prev_pnt.pos_l and p.pos_y < prev_pnt.pos_y) or (
-                    p in condensed_paths[i]
-                ):
-                    continue
-
-                condensed_paths[i].append(p)
-                prev_pnt = condensed_paths[i][-1]
-        # clusters will be used to distribute the pheromone
-        # on the points in the vicinity of the ceteriods
-        clusters = {}
-        points = np.array(points)
-        labels = np.array(labels)
-        for i, point in enumerate(centeroids):
-            clusters[point.id] = points[labels == i]
-        for i, lag in enumerate(labels):
-            if lag == -1:
-                clusters[points[i].id] = [points[i]]
-        for path in condensed_paths:
-            clusters[path[0].id] = [path[0]]
-            clusters[path[-1].id] = [path[-1]]
-
-        for i, path in enumerate(condensed_paths):
-            self.logger.debug(f"Path {i}")
-            for pnt in path:
-                self.logger.debug(
-                    f"\t Point id: {pnt.id} Point Type: {pnt.type} " +
-                    f"Point Name: {pnt.name} x:{pnt.pos_x:.4f} " +
-                    f" y:{pnt.pos_y:.4f} l:{pnt.pos_l} w:{pnt.pos_w:.4f}"
-                )
-        self.logger.info(f"COLONY({self.id}):: Finished building RNN from Ants' paths")
-        # self.animate(condensed_paths)
-        return RNN(
-            paths=condensed_paths,
-            centeroids_clusters=clusters,
-            lags=self.space_lags,
-            loss_fun=self.loss_fun,
-        )
-
-    def animate(self, ants_paths) -> None:
-        """
-        Plot CANTS search space
-        """
-        points = []
-        for level, in_space in enumerate(self.space.inputs_space.inputs_space.values()):
-            for pnt in in_space.points:
-                points.append([pnt.pos_x, pnt.pos_y, pnt.pos_l, pnt.pheromone])
-        for pnt in self.space.output_space.points:
-            points.append([pnt.pos_x, pnt.pos_y, pnt.pos_l, pnt.pheromone])
-        for pnt in self.space.all_points.values():
-            points.append([pnt.pos_x, pnt.pos_y, pnt.pos_l, pnt.pheromone])
-
-        import matplotlib.pyplot as plt
-
-        points = np.array(points)
-        fig = plt.figure()
-        ax = fig.add_subplot(111, projection="3d")
-        ax.scatter(
-            points[:, 0],
-            points[:, 1],
-            points[:, 2],
-            s=points[:, 3] * 10,
-            c=points[:, 3],
-            cmap="copper",
-        )
-        for path in ants_paths:
-            pnts = []
-            for pnt in path[:-1]:
-                pnts.append([pnt.pos_x, pnt.pos_y, pnt.pos_l])
-            pnts.append([path[-1].pos_x, path[-1].pos_y, self.space.time_lags])
-            pnts = np.array(pnts)
-            plt.plot(pnts[:, 0], pnts[:, 1], pnts[:, 2])
-
-        plt.show(block=False)
-        plt.pause(0.001)
-        plt.close()
-        plt.cla()
-        plt.clf()
-
-    def insert_rnn(self, rnn: RNN) -> None:
-        """
-        inserts rnn to the population and sorts based on rnns fitnesses
-        """
-        inserted_rnn = False
-        if len(self.best_rnns) < self.best_population_size:
-            self.best_rnns.append([rnn.fitness, rnn])
-        else:
-            if self.best_rnns[-1][0] > rnn.fitness:
-                self.best_rnns[-1] = [rnn.fitness, rnn]
-                self.update_search_space_weights(rnn)
-                self.update_pheromone_const(rnn)
-                inserted_rnn = True
-                # TODO Put the other pheromone update options
-
-        self.best_rnns = sorted(self.best_rnns, key=lambda r: r[0])
-        self.space.evaporate_pheromone()
-        self.logger.info(
-            f"COLONY({self.id})::\t RNN Fitness: {rnn.fitness:.7f} " +
-            f"(Best RNN Fitness: {self.best_rnns[0][0]:.7f})"
-        )
-        return inserted_rnn
-
-    def evaluate_rnn(self, rnn: RNN) -> None:
-        """
-        training/testing RNN
-        """
-        self.logger.info(f"COLONY({self.id}):: Staring RNN Colony Evaluating")
-
-        self.logger.info(f"COLONY({self.id}):: \t starting training")
-        if self.use_bp:
-            self.logger.info(
-                f"\tCOLONY({self.id}):: Using BP, (number of Epochs: {self.num_epochs})"
-            )
-            # for _ in tqdm(range(self.num_epochs), colour="green"):
-            for k in range(self.num_epochs):
-                logger.info(f"Evalutating RNN {k}/{self.num_epochs}")
-                rnn.do_epoch(
-                    self.data.train_input,
-                    self.data.train_output,
-                    do_feedbck=self.use_bp,
-                )
-        else:
-            rnn.do_epoch(
-                self.data.train_input, self.data.train_output, do_feedbck=self.use_bp
-            )
-        self.logger.info(f"COLONY({self.id}):: \t finished training")
-
-        self.logger.info(f"COLONY({self.id}):: \t starting RNN evaluation")
-        rnn.test_rnn(self.data.test_input, self.data.test_output)
-        self.logger.info(f"COLONY({self.id}):: \t finished RNN evaluation... Testing Fitness: {rnn.fitness}")
-
-        self.logger.info(f"COLONY({self.id}):: Finished RNN Colony Evaluation")
-        return rnn
-
-    def thread_controller(self, total_marchs, num_threads: int):
-        from concurrent.futures import ThreadPoolExecutor
-
-        """
-        function to control threads for BP CATNS and ANTS
-        """
-        if self.use_cants:
-            logger.info("COLONY({self.id}):: Starting 3D CANTS (with threading)")
-        else:
-            logger.info("COLONY({self.id}):: Starting ANTS (with threading)")
-
-        def thread_worker(rnn) -> None:
-            """
-            training/testing RNN
-            """
-            self.evaluate_rnn(rnn)
-            return rnn
-
-        def prepare_rnn():
-            if self.use_cants:
-                rnn = self.create_nn_cants()
-            else:
-                rnn = self.create_nn_ants()
-            return rnn
-
-        def process_rnn(rnn):
-            if rnn.centeroids_clusters:
-                for ant in self.foragers:
-                    ant.update_best_behaviors(rnn.fitness)
-                    ant.evolve_behavior()
-            self.insert_rnn(rnn)
-
-        march = 0
-        threads = []
-        for _ in range(min(total_marchs, num_threads)):
-            rnn = prepare_rnn()
-            logger.info(f"THREAD {_}")
-            executor = ThreadPoolExecutor(max_workers=num_threads)
-            feature = executor.submit(thread_worker, rnn)
-            threads.append({"thread": executor, "feature": feature})
-
-        turn = True
-        while turn:
-            if march == total_marchs:
-                break
-            rnn = prepare_rnn()
-            for t in threads:
-                if t["feature"].done():
-                    process_rnn(t["feature"].result())
-                    march += 1
-                    logger.info(format(f"March No. {march}", "*^40"))
-                    self.logger.info(
-                        f"COLONY({self.id}): Interation {march}/{total_marchs}"
-                    )
-                    if march == total_marchs:
-                        turn = False
-                        break
-                    threads.remove(t)
-                    rnn = prepare_rnn()
-                    executor = ThreadPoolExecutor(max_workers=1)
-                    executor.submit(thread_worker, rnn)
-                    threads.append({"thread": executor, "feature": feature})
-                    break
-
-    def save_result_to_file(self, stime: float, fitness: float):
-        time_stamp = now.strftime('%d_%m_%Y_%H_%M_%S')
-        bp = ("bp" if self.use_bp else "wzbp")
-        cants = ("CANTS" if self.use_cants else "ANTS")
-        with open("/".join([self.out_dir, f"nants{self.num_ants}_{bp}_{cants}.res"]), 'a') as fl:
-            fl.write("{}, {}, {}\n".format(time_stamp, stime, fitness))
-
-    def save_rnn(self, rnn: RNN, iteration = ""):
-        bp = ("bp" if self.use_bp else "wzbp")
-        cants = ("CANTS" if self.use_cants else "ANTS")
-        time_stamp = now.strftime('%Y_%m_%d_%H_%M_%S')
-        with open("/".join([self.out_dir, f"{iteration}_{time_stamp}_nants{self.num_ants}_{bp}_{cants}.rnn"]), 'wb') as fl:
-            pickle.dump(rnn, fl) 
-
-    def life(self, total_marchs) -> None:
-        """
-        Do colony foraging
-        """
-        start_time = time()
-        if self.num_threads != 0:
-            self.thread_controller(total_marchs, self.num_threads)
-        else:
-            logger.info("COLONY({self.id}):: Starting BP-free 4D CANTS")
-            self.num_epochs = 1
-            # for march_num in tqdm(range(total_marchs, colour="red")):
-            for march_num in range(total_marchs):
-                self.logger.info(
-                    f"Colony({self.id}): Iteration {march_num}/{total_marchs}"
-                )
-                rnn = self.create_nn_cants()
-                rnn = self.evaluate_rnn(rnn)
-                for ant in self.foragers:
-                    ant.update_best_behaviors(rnn.fitness)
-                    ant.evolve_behavior()
-                inserted_rnn = self.insert_rnn(rnn)
-                if inserted_rnn:
-                    end_time = time() - start_time
-                    self.save_rnn(self.best_rnns[0][1], march_num)
-            #self.num_epochs = 1
-
-        end_time = time() - start_time
-        logger.info(f"Elapsed Time: {end_time}")
-        self.save_result_to_file(end_time, self.best_rnns[0][0])
-
-
-
-        if self.use_cants:
-            colony.use_bp = True
-            colony.num_epochs = 1000
-            evaluated_rnn = colony.evaluate_rnn(colony.best_rnns[0][1])
-            self.save_result_to_file(time()-start_time, evaluated_rnn.fitness)
-            self.save_rnn(evaluated_rnn, "-")
             
+        if self.mortality_rate < self.pso_bounds[1][0] or self.mortality_rate > self.pso_bounds[1][1]:
+            self.mortality_rate = np.random.uniform(
+                low=self.pso_bounds[1][0], high=self.pso_bounds[1][1]
+            )
+            
+        if self.evaporation_rate < self.pso_bounds[2][0] or self.evaporation_rate > self.pso_bounds[2][1]:
+            self.evaporation_rate = np.random.uniform(
+                low=self.pso_bounds[2][0], high=self.pso_bounds[2][1]
+            )
+            
+        self.pso_position[0] = self.num_ants
+        self.pso_position[1] = self.mortality_rate
+        self.pso_position[2] = self.evaporation_rate
 
-    def life_mpi(self, total_marchs) -> None:
-        """
-        Do colony forging with mpi
-        """
-        from mpi4py import MPI
-
-        mpi_comm = MPI.COMM_WORLD
-        mpi_size = mpi_comm.Get_size()
-        rank = mpi_comm.Get_rank()
-        self.logger.info(f"My MPI Rank is : {rank}")
-
-        def worker():
-            while True:
-                self.logger.debug(f"Worker({rank}) is waiting msg")
-                (
-                    stop,
-                    self.space.all_points,
-                    self.space.inputs_space,
-                    self.space.output_space,
-                ) = mpi_comm.recv(source=0)
-                self.logger.debug(f"Worker({rank}) recieved a msg(terminate:{stop})")
-                if stop:
-                    break
-
-                start_create_nn_time_stamp = time()
-                if self.use_cants:
-                    rnn = self.create_nn_cants()
-                else:
-                    rnn = self.create_nn_ants()
-                create_nn_time = time() - start_create_nn_time_stamp
-
-                time_log_file = ""
-                if self.use_bp:
-                    time_log_file = f"cants_wzbp_time_id{rank}.log"
-                else:
-                    time_log_file = f"cants_wobp_time_id{rank}.log"
-                    
-                with open(time_log_file, 'a') as f:
-                    f.write(f"{create_nn_time}")
-
-                start_eval_nn_time_stamp = time()
-                rnn = self.evaluate_rnn(rnn)
-                eval_nn_time = time() - start_eval_nn_time_stamp
-                with open(time_log_file, 'a') as f:
-                    f.write(f",{eval_nn_time}" + "\n")
-
-
-                for ant in self.foragers:
-                    ant.update_best_behaviors(rnn.fitness)
-                    ant.evolve_behavior()
-                self.logger.debug(f"Worker({rank}) sending a msg")
-                mpi_comm.send(
-                    [
-                        rnn,
-                        self.space.all_points,
-                        self.space.inputs_space,
-                        self.space.output_space,
-                    ],
-                    dest=0,
-                )
-                self.logger.debug(f"Worker({rank}) sent a msg")
-
-        def main():
-            status = MPI.Status()
-            for worker in range(1, mpi_size):
-                self.logger.debug(f"Main sending to Worker: {worker}")
-                mpi_comm.send(
-                    [
-                        False,
-                        self.space.all_points,
-                        self.space.inputs_space,
-                        self.space.output_space,
-                    ],
-                    dest=worker,
-                )
-                self.logger.debug(f"Main send to Worker:{worker}")
-            '''
-            for march_num in tqdm(
-                range(total_marchs - (mpi_size - 1)),
-                colour="red",
-                desc="Counting Marchs...",
-            ):
-            '''
-            for march_num in range(total_marchs - (mpi_size - 1)):
-                self.logger.info(
-                    f"Main Process: Colony({self.id}): Iteration {march_num}/{total_marchs}"
-                )
-                self.logger.debug("Main waiting for Worker Response")
-                (
-                    rnn,
-                    self.space.all_points,
-                    self.space.inputs_space,
-                    self.space.output_space,
-                ) = mpi_comm.recv(status=status)
-                self.logger.debug(f"Main Received from Worker: {status.Get_source()}")
-                inserted_rnn = self.insert_rnn(rnn)
-                if inserted_rnn:
-                    end_time = time() - start_time
-                    self.save_rnn(self.best_rnns[0][1], march_num)
-                mpi_comm.send(
-                    [
-                        False,
-                        self.space.all_points,
-                        self.space.inputs_space,
-                        self.space.output_space,
-                    ],
-                    dest=status.Get_source(),
-                )
-            '''
-            for worker in tqdm(
-                range(1, mpi_size),
-                colour="red",
-                desc=f"Counting Last {mpi_size -1} Marchs...",
-            ):
-            '''
-            for worker in range(1, mpi_size):
-                self.logger.info(
-                    f"Main Process: Colony({self.id}): Iteration {march_num+worker}/{total_marchs}"
-                )
-                (
-                    rnn,
-                    self.space.all_points,
-                    self.space.inputs_space,
-                    self.space.output_space,
-                ) = mpi_comm.recv(status=status)
-                inserted_rnn = self.insert_rnn(rnn)
-                if inserted_rnn:
-                    end_time = time() - start_time
-                    self.save_rnn(self.best_rnns[0][1], worker)
-                
-                mpi_comm.send([True, None, None, None], dest=status.Get_source())
-
-        if rank == 0:
-            if colony.use_cants:
-                if colony.use_bp:
-                    logger.info("Main Process: COLONY({self.id}):: Starting 3D CANTS With-BP")
-                else:
-                    logger.info("Main Process: COLONY({self.id}):: Starting 4D CANTS BP-Free")
-            else:
-                logger.info("Main Process: COLONY({self.id}):: Starting ANTS")
-
-                """
-                Found that sending the massive structure
-                using mpi_comm.send was hitting the max
-                allowed number of recurrsive iterations: 1K
-                """
-                sys.setrecursionlimit(20000)
-                logger.info(f"Main Process: Using the total numbe of threads: {sys.getrecursionlimit()}")
-
-            start_time = time()
-            main()
-            end_time = time() - start_time
-            logger.info(f"Elapsed Time: {end_time}")
-            self.save_result_to_file(end_time, self.best_rnns[0][0])
-
-            """
-            Train only the best rnn with BP
-            (ONLY FOR BP-FREE CANTS)
-            """
-            if colony.use_cants and not colony.use_bp:
-                colony.use_bp = True
-                colony.num_epochs = 1
-                evaluated_rnn = colony.evaluate_rnn(colony.best_rnns[0][1])
-                self.save_result_to_file(time()-start_time, evaluated_rnn.fitness)
-                self.save_rnn(evaluated_rnn, "-")
-
-        else:
-            worker()
-
-
-if __name__ == "__main__":
-
-    args = Args_Parser(sys.argv)
-
-    logger_format = (
-        "\n<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-        "<level>{level: <8}</level> | "
-        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
-        "{extra[ip]} {extra[user]} - <level>{message}</level>"
-    )
-    logger.configure(extra={"ip": "", "user": ""})  # Default values
-
-    logger.remove()
-    # logger.add(sys.stdout, level=args.term_log_level)
-    logger.add(sys.stdout, format=logger_format, level=args.term_log_level)
-
-    data = Timeseries(
-        data_files=args.data_files,
-        input_params=args.input_names,
-        output_params=args.output_names,
-        data_dir=args.data_dir,
-        future_time=1,
-    )
-
-    colony = Colony(
-        data=data,
-        num_ants=args.num_ants,
-        use_bp=args.use_bp,
-        max_pheromone=args.max_pheromone,
-        min_pheromone=args.min_pheromone,
-        default_pheromone=args.default_pheromone,
-        num_epochs=args.bp_epochs,
-        population_size=args.colony_population_size,
-        space_lags=args.time_lags,
-        dbscan_dist=args.dbscan_dist,
-        evaporation_rate=args.evaporation_rate,
-        log_dir=args.log_dir,
-        out_dir=args.out_dir,
-        logger=logger,
-        col_log_level=args.col_log_level,
-        log_file_name=args.log_file_name,
-        num_threads=args.num_threads,
-        ants_mortality=0.1,
-        use_cants=args.use_cants,
-        loss_fun=args.loss_fun,
-        act_fun=args.act_fun,
-    )
-
-    if args.num_threads != 0:
-        colony.life(args.living_time)
-    else:
-        colony.life_mpi(args.living_time)
+        self.space.evaporation_rate = self.evaporation_rate
+        

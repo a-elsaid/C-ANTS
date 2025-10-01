@@ -12,6 +12,7 @@ class Timeseries:
         input_params: str,
         output_params: str,
         data_dir: str = ".",
+        norm_type: str = "none",
         time_lag: int = 0,
         future_time: int = 0,
     ):
@@ -21,7 +22,7 @@ class Timeseries:
         self.file_names = [x.strip() for x in data_files.split(" ")]
         self.load_data_from_files(self.input_names, self.output_names)
         input_padding = np.zeros((time_lag, len(self.input_names)), dtype=np.float32)
-        norm_fun = self.normalization("none")
+        norm_fun = self.normalization(norm_type)
         self.input_data = np.array(norm_fun(self.input_data))
         if future_time != 0:
             self.input_data = self.input_data[:-future_time]
@@ -64,7 +65,9 @@ class Timeseries:
         if not os.path.exists(file_name):
             logger.error(f" File: {file_name} Does Not Exist")
             sys.exit()
-        data = pd.read_csv(file_name, sep=",", skipinitialspace=True, dtype=np.float32)
+        all_param_names = list(set(self.input_names + self.output_names))
+        data = pd.read_csv(file_name, sep=",", skipinitialspace=True)
+        data = data[all_param_names].astype(np.float32)
         return data[in_params], data[out_params]
 
     def none_normalize(self, data):

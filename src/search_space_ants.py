@@ -11,7 +11,7 @@ NODE_TYPE = {"INPUT": 0, "HIDDEN": 1, "OUTPUT": 2}
 DEFAULT_LAG = 10
 
 
-class RNNSearchSpaceANTS:
+class SearchSpaceANTS:
     def __init__(
         self,
         logger,
@@ -112,7 +112,7 @@ class RNNSearchSpaceANTS:
             self.name = name
             if self.name is not None:
                 self.type = point_type
-            RNNSearchSpaceANTS.Point.counter += 1
+            SearchSpaceANTS.Point.counter += 1
 
     class Link:
         def __init__(self, in_node, out_node, weight: float = None) -> None:
@@ -136,10 +136,10 @@ class RNNSearchSpaceANTS:
             self.time_lags = lags
             self.name: str = name
             self.in_num: int = in_num
-            self.points: List[RNNSearchSpaceANTS.Point] = []
+            self.points: List[SearchSpaceANTS.Point] = []
             for lag in range(lags):
                 self.points.append(
-                    RNNSearchSpaceANTS.Point(
+                    SearchSpaceANTS.Point(
                         lag=lag,
                         point_type=NODE_TYPE["INPUT"],
                         name=name,
@@ -172,7 +172,7 @@ class RNNSearchSpaceANTS:
             self.min_pheromone = min_pheromone
             self.evaporation_rate = evaporation_rate
             for i, name in enumerate(inputs_names):
-                self.inputs_spaces[name] = RNNSearchSpaceANTS.Single_Input_Space(
+                self.inputs_spaces[name] = SearchSpaceANTS.Single_Input_Space(
                     in_num=i, lags=lags, name=self.inputs_names[i]
                 )
             if len(self.inputs_spaces) != len(inputs_names):
@@ -234,7 +234,7 @@ class RNNSearchSpaceANTS:
     class Outputs_Space:
         def __init__(self, outputs_names):
             self.points = [
-                RNNSearchSpaceANTS.Point(
+                SearchSpaceANTS.Point(
                     lag=0,
                     hid=(i + 1) / len(outputs_names),
                     point_type=NODE_TYPE["OUTPUT"],
