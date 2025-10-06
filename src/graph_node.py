@@ -32,7 +32,7 @@ class GraphNode():
         self.backfire = 0.0
         self.forefire = []
         self.d_node_value = None                  # Error value for output nodes only
-        self.out = 0.0
+        self.out = None
         self.received_fire = 0
         self.recieved_backfire = 0
         self.point = point

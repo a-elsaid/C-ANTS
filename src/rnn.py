@@ -1,6 +1,6 @@
 """ RNN class """
 import sys
-from typing import List, Dict
+from typing import List, Dict, Optional
 import numpy as np
 from tqdm import tqdm
 import torch
@@ -16,7 +16,8 @@ class RNN(Structure):
     def __init__(
             self,
             ants_paths,
-            space: SearchSpaceCANTS | SearchSpaceANTS,
+            # space: SearchSpaceCANTS | SearchSpaceANTS,
+            space,
             eps: float = 0.25,
             lags: int = 5,
             min_samples: int = 2,

@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from sklearn.cluster import DBSCAN
 import numpy as np
 from point import Point
@@ -586,6 +587,23 @@ class Structure:
         obj = cls.__new__(cls)
         obj.__dict__.update(state)
         return obj
+
+    def single_thrust_test(self, data):
+        if self.use_torch:
+            input = torch.tensor(data.test_input, requires_grad=False, dtype=torch.float32)
+            target = torch.tensor(data.test_output, requires_grad=False, dtype=torch.float32)
+        else:
+            input = data.test_input
+            target = data.test_output
+        try:
+            _,_,_ = self.single_thrust(input, target, prt=False, cal_gradient=True)
+            return True
+        except Exception as e:
+            logger.error(f"Error in single_thrust_test: {e}")
+            # raise e
+            return False
+        
+
 
     """ 
     ************************************ Visualization *************************************** 

@@ -86,7 +86,7 @@ class RNN_Node(Super_Node):
         self,
         type=0,
         point: Point = None,
-        lags: int | None = None,
+        lags: int = None,
         use_torch: bool = False,
         activation_type: str = "sigmoid",
     ) -> None:
@@ -146,7 +146,7 @@ class LSTM_Node(RNN_Node):
          self,
         type=0,
         point: Point = None,
-        lags: int | None = None,
+        lags: int = None,
         use_torch: bool = False,
         activation_type: str = "relu",
     ) -> None:
@@ -209,7 +209,7 @@ class BNN_LSTM_Node(LSTM_Node):
          self,
         type=0,
         point: Point = None,
-        lags: int | None = None,
+        lags: int  = None,
         use_torch: bool = False,
         activation_type: str = "sigmoid",
         prior_mu=0,

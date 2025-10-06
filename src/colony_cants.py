@@ -275,6 +275,11 @@ class Colony():
         thd = threading.current_thread()
         logger.info(f"Colony({self.id:2d}) -- Thread({thd.name}) -- Generating and Evaluating Model")
         model = self.ants_forage(increase_exploration=increase_exploration)
+
+
+        if not model.single_thrust_test(self.data):
+            logger.info(f"Colony({self.id:2d}) -- Thread({thd.name}) -- Single Thrust Test Failed, Regenerating Model") #TODO: Fix nodes not firing issue
+            return float('inf'), model
         th_id = threading.current_thread().name
         fit, _ = model.evaluate(self.data, cost_type=cost_type, num_epochs=train_epochs, thread_id=th_id, lr=self.lr)
         return fit, model
