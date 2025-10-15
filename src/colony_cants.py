@@ -193,7 +193,7 @@ class Colony():
         if len(self.best_solutions) < self.population_size:
             self.best_solutions.append([score, solution])
             inserted = True
-        elif score > self.best_solutions[0][0]:
+        elif score < self.best_solutions[-1][0]:
             self.best_solutions[-1] = [score, solution]
             inserted = True
         self.best_solutions.sort(key=lambda x: x[0])
